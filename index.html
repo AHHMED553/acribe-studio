@@ -1,0 +1,516 @@
+// Acribe v0.1 - a small, fast, dynamic language
+// Build: g++ -O2 -std=c++17 acribe.cpp -o acribe
+// Run:   ./acribe file.acr     (or ./acribe for the REPL)
+#include <bits/stdc++.h>
+using namespace std;
+
+// ============================ Errors ============================
+struct AcribeError { string msg; int line; };
+
+// ============================ Lexer =============================
+enum class T {
+  Num, Str, Id,
+  Let, Fn, If, Else, While, For, Return, True, False, Null, Break, Continue,
+  LP, RP, LB, RB, Comma, Semi,
+  Plus, Minus, Star, Slash, Percent, Bang, Assign, EqEq, Ne, Lt, Le, Gt, Ge, And, Or,
+  End
+};
+struct Token { T t; string s; double n = 0; int line = 1; };
+
+vector<Token> lex(const string& src) {
+  static const unordered_map<string, T> kw = {
+    {"let", T::Let}, {"fn", T::Fn}, {"if", T::If}, {"else", T::Else},
+    {"while", T::While}, {"for", T::For}, {"return", T::Return},
+    {"true", T::True}, {"false", T::False}, {"null", T::Null},
+    {"break", T::Break}, {"continue", T::Continue}};
+  vector<Token> out;
+  int line = 1;
+  size_t i = 0, n = src.size();
+  auto add = [&](T t, string s = "", double v = 0) { out.push_back({t, s, v, line}); };
+  while (i < n) {
+    char c = src[i];
+    if (c == '\n') { line++; i++; }
+    else if (isspace((unsigned char)c)) i++;
+    else if (c == '/' && i + 1 < n && src[i + 1] == '/') { while (i < n && src[i] != '\n') i++; }
+    else if (isdigit((unsigned char)c)) {
+      size_t j = i;
+      while (j < n && isdigit((unsigned char)src[j])) j++;
+      if (j + 1 < n && src[j] == '.' && isdigit((unsigned char)src[j + 1])) {
+        j++;
+        while (j < n && isdigit((unsigned char)src[j])) j++;
+      }
+      add(T::Num, "", stod(src.substr(i, j - i)));
+      i = j;
+    } else if (isalpha((unsigned char)c) || c == '_') {
+      size_t j = i;
+      while (j < n && (isalnum((unsigned char)src[j]) || src[j] == '_')) j++;
+      string w = src.substr(i, j - i);
+      auto it = kw.find(w);
+      add(it != kw.end() ? it->second : T::Id, w);
+      i = j;
+    } else if (c == '"') {
+      string s; i++;
+      while (i < n && src[i] != '"') {
+        if (src[i] == '\n') line++;
+        if (src[i] == '\\' && i + 1 < n) {
+          i++;
+          switch (src[i]) { case 'n': s += '\n'; break; case 't': s += '\t'; break;
+                            case '"': s += '"'; break; case '\\': s += '\\'; break;
+                            default: s += src[i]; }
+        } else s += src[i];
+        i++;
+      }
+      if (i >= n) throw AcribeError{"Unterminated string", line};
+      i++;
+      add(T::Str, s);
+    } else {
+      auto two = [&](char nx) { return i + 1 < n && src[i + 1] == nx; };
+      switch (c) {
+        case '(': add(T::LP); break;   case ')': add(T::RP); break;
+        case '{': add(T::LB); break;   case '}': add(T::RB); break;
+        case ',': add(T::Comma); break; case ';': add(T::Semi); break;
+        case '+': add(T::Plus); break; case '-': add(T::Minus); break;
+        case '*': add(T::Star); break; case '/': add(T::Slash); break;
+        case '%': add(T::Percent); break;
+        case '!': if (two('=')) { add(T::Ne); i++; } else add(T::Bang); break;
+        case '=': if (two('=')) { add(T::EqEq); i++; } else add(T::Assign); break;
+        case '<': if (two('=')) { add(T::Le); i++; } else add(T::Lt); break;
+        case '>': if (two('=')) { add(T::Ge); i++; } else add(T::Gt); break;
+        case '&': if (two('&')) { add(T::And); i++; } else throw AcribeError{"Unexpected '&'", line}; break;
+        case '|': if (two('|')) { add(T::Or); i++; } else throw AcribeError{"Unexpected '|'", line}; break;
+        default: throw AcribeError{string("Unexpected character '") + c + "'", line};
+      }
+      i++;
+    }
+  }
+  add(T::End);
+  return out;
+}
+
+// ============================ Values ============================
+struct Interp; struct Callable;
+struct Value {
+  enum Ty { Nil, Num, Bool, Str, Fn } ty = Nil;
+  double n = 0; bool b = false; string s; shared_ptr<Callable> f;
+  static Value num(double d) { Value v; v.ty = Num; v.n = d; return v; }
+  static Value boolean(bool x) { Value v; v.ty = Bool; v.b = x; return v; }
+  static Value str(string x) { Value v; v.ty = Str; v.s = move(x); return v; }
+};
+struct Callable {
+  int arity = 0; string name;  // arity -1 = variadic
+  virtual ~Callable() {}
+  virtual Value call(Interp&, vector<Value>&, int line) = 0;
+};
+
+string numToStr(double d) {
+  if (d == floor(d) && fabs(d) < 1e15) { char b[32]; snprintf(b, sizeof b, "%.0f", d); return b; }
+  char b[40]; snprintf(b, sizeof b, "%.14g", d); return b;
+}
+string toStr(const Value& v) {
+  switch (v.ty) {
+    case Value::Nil: return "null";
+    case Value::Num: return numToStr(v.n);
+    case Value::Bool: return v.b ? "true" : "false";
+    case Value::Str: return v.s;
+    case Value::Fn: return "<fn " + v.f->name + ">";
+  }
+  return "";
+}
+bool truthy(const Value& v) { return !(v.ty == Value::Nil || (v.ty == Value::Bool && !v.b)); }
+bool equals(const Value& a, const Value& b) {
+  if (a.ty != b.ty) return false;
+  switch (a.ty) {
+    case Value::Nil: return true;
+    case Value::Num: return a.n == b.n;
+    case Value::Bool: return a.b == b.b;
+    case Value::Str: return a.s == b.s;
+    case Value::Fn: return a.f == b.f;
+  }
+  return false;
+}
+
+// ============================== AST =============================
+struct Expr; struct Stmt;
+using EP = shared_ptr<Expr>; using SP = shared_ptr<Stmt>;
+struct Expr {
+  enum K { Lit, Var, Assign, Unary, Binary, Logic, Call } k;
+  Value val; string name; T op = T::End; EP a, b; vector<EP> args; int line = 0;
+};
+struct Stmt {
+  enum K { ExprS, Let, Block, If, While, For, Fn, Return, Break, Continue } k;
+  EP e, inc; string name; vector<SP> body; SP a, b; vector<string> params; int line = 0;
+};
+
+// ============================ Parser ============================
+struct Parser {
+  vector<Token> tk; size_t p = 0;
+  explicit Parser(vector<Token> t) : tk(move(t)) {}
+  const Token& cur() { return tk[p]; }
+  bool check(T t) { return cur().t == t; }
+  bool match(T t) { if (check(t)) { p++; return true; } return false; }
+  const Token& expect(T t, const string& msg) {
+    if (!check(t)) throw AcribeError{msg, cur().line};
+    return tk[p++];
+  }
+  vector<SP> program() { vector<SP> v; while (!check(T::End)) v.push_back(decl()); return v; }
+
+  SP mk(Stmt::K k, int line) { auto s = make_shared<Stmt>(); s->k = k; s->line = line; return s; }
+  EP mkE(Expr::K k, int line) { auto e = make_shared<Expr>(); e->k = k; e->line = line; return e; }
+
+  SP decl() {
+    if (check(T::Let)) return letDecl();
+    if (check(T::Fn) && tk[p + 1].t == T::Id) return fnDecl();
+    return stmt();
+  }
+  SP letDecl() {
+    int ln = cur().line; p++;
+    auto s = mk(Stmt::Let, ln);
+    s->name = expect(T::Id, "Expected variable name").s;
+    if (match(T::Assign)) s->e = expr();
+    expect(T::Semi, "Expected ';' after variable declaration");
+    return s;
+  }
+  SP fnDecl() {
+    int ln = cur().line; p++;
+    auto s = mk(Stmt::Fn, ln);
+    s->name = expect(T::Id, "Expected function name").s;
+    expect(T::LP, "Expected '(' after function name");
+    if (!check(T::RP)) do { s->params.push_back(expect(T::Id, "Expected parameter name").s); } while (match(T::Comma));
+    expect(T::RP, "Expected ')' after parameters");
+    expect(T::LB, "Expected '{' before function body");
+    s->body = blockBody();
+    return s;
+  }
+  vector<SP> blockBody() {
+    vector<SP> v;
+    while (!check(T::RB) && !check(T::End)) v.push_back(decl());
+    expect(T::RB, "Expected '}'");
+    return v;
+  }
+  SP stmt() {
+    int ln = cur().line;
+    if (match(T::LB)) { auto s = mk(Stmt::Block, ln); s->body = blockBody(); return s; }
+    if (match(T::If)) {
+      auto s = mk(Stmt::If, ln);
+      expect(T::LP, "Expected '(' after 'if'"); s->e = expr(); expect(T::RP, "Expected ')'");
+      s->a = stmt();
+      if (match(T::Else)) s->b = stmt();
+      return s;
+    }
+    if (match(T::While)) {
+      auto s = mk(Stmt::While, ln);
+      expect(T::LP, "Expected '(' after 'while'"); s->e = expr(); expect(T::RP, "Expected ')'");
+      s->a = stmt();
+      return s;
+    }
+    if (match(T::For)) {
+      auto s = mk(Stmt::For, ln);
+      expect(T::LP, "Expected '(' after 'for'");
+      if (match(T::Semi)) s->a = nullptr;
+      else if (check(T::Let)) s->a = letDecl();
+      else { auto es = mk(Stmt::ExprS, ln); es->e = expr(); expect(T::Semi, "Expected ';'"); s->a = es; }
+      if (!check(T::Semi)) s->e = expr();
+      expect(T::Semi, "Expected ';' after loop condition");
+      if (!check(T::RP)) s->inc = expr();
+      expect(T::RP, "Expected ')' after for clauses");
+      s->b = stmt();
+      return s;
+    }
+    if (match(T::Return)) {
+      auto s = mk(Stmt::Return, ln);
+      if (!check(T::Semi)) s->e = expr();
+      expect(T::Semi, "Expected ';' after return");
+      return s;
+    }
+    if (match(T::Break)) { expect(T::Semi, "Expected ';'"); return mk(Stmt::Break, ln); }
+    if (match(T::Continue)) { expect(T::Semi, "Expected ';'"); return mk(Stmt::Continue, ln); }
+    auto s = mk(Stmt::ExprS, ln);
+    s->e = expr();
+    expect(T::Semi, "Expected ';' after expression");
+    return s;
+  }
+
+  EP expr() { return assignment(); }
+  EP assignment() {
+    EP l = orE();
+    if (check(T::Assign)) {
+      int ln = cur().line; p++;
+      EP v = assignment();
+      if (l->k != Expr::Var) throw AcribeError{"Invalid assignment target", ln};
+      auto e = mkE(Expr::Assign, ln); e->name = l->name; e->a = v; return e;
+    }
+    return l;
+  }
+  EP bin(Expr::K k, T op, EP a, EP b, int ln) { auto e = mkE(k, ln); e->op = op; e->a = a; e->b = b; return e; }
+  EP orE() { EP l = andE(); while (check(T::Or)) { int ln = cur().line; p++; l = bin(Expr::Logic, T::Or, l, andE(), ln); } return l; }
+  EP andE() { EP l = eq(); while (check(T::And)) { int ln = cur().line; p++; l = bin(Expr::Logic, T::And, l, eq(), ln); } return l; }
+  EP eq() {
+    EP l = cmp();
+    while (check(T::EqEq) || check(T::Ne)) { T o = cur().t; int ln = cur().line; p++; l = bin(Expr::Binary, o, l, cmp(), ln); }
+    return l;
+  }
+  EP cmp() {
+    EP l = term();
+    while (check(T::Lt) || check(T::Le) || check(T::Gt) || check(T::Ge)) { T o = cur().t; int ln = cur().line; p++; l = bin(Expr::Binary, o, l, term(), ln); }
+    return l;
+  }
+  EP term() {
+    EP l = factor();
+    while (check(T::Plus) || check(T::Minus)) { T o = cur().t; int ln = cur().line; p++; l = bin(Expr::Binary, o, l, factor(), ln); }
+    return l;
+  }
+  EP factor() {
+    EP l = unary();
+    while (check(T::Star) || check(T::Slash) || check(T::Percent)) { T o = cur().t; int ln = cur().line; p++; l = bin(Expr::Binary, o, l, unary(), ln); }
+    return l;
+  }
+  EP unary() {
+    if (check(T::Bang) || check(T::Minus)) {
+      T o = cur().t; int ln = cur().line; p++;
+      auto e = mkE(Expr::Unary, ln); e->op = o; e->a = unary(); return e;
+    }
+    return call();
+  }
+  EP call() {
+    EP e = primary();
+    while (check(T::LP)) {
+      int ln = cur().line; p++;
+      auto c = mkE(Expr::Call, ln); c->a = e;
+      if (!check(T::RP)) do { c->args.push_back(expr()); } while (match(T::Comma));
+      expect(T::RP, "Expected ')' after arguments");
+      e = c;
+    }
+    return e;
+  }
+  EP primary() {
+    const Token& t = cur(); int ln = t.line;
+    if (match(T::Num)) { auto e = mkE(Expr::Lit, ln); e->val = Value::num(t.n); return e; }
+    if (match(T::Str)) { auto e = mkE(Expr::Lit, ln); e->val = Value::str(t.s); return e; }
+    if (match(T::True)) { auto e = mkE(Expr::Lit, ln); e->val = Value::boolean(true); return e; }
+    if (match(T::False)) { auto e = mkE(Expr::Lit, ln); e->val = Value::boolean(false); return e; }
+    if (match(T::Null)) { auto e = mkE(Expr::Lit, ln); return e; }
+    if (match(T::Id)) { auto e = mkE(Expr::Var, ln); e->name = t.s; return e; }
+    if (match(T::LP)) { EP e = expr(); expect(T::RP, "Expected ')'"); return e; }
+    throw AcribeError{"Unexpected token in expression", ln};
+  }
+};
+
+// =========================== Interpreter ========================
+struct Env {
+  unordered_map<string, Value> vars; shared_ptr<Env> parent;
+  explicit Env(shared_ptr<Env> p = nullptr) : parent(move(p)) {}
+  Value* find(const string& n) {
+    for (Env* e = this; e; e = e->parent.get()) {
+      auto it = e->vars.find(n);
+      if (it != e->vars.end()) return &it->second;
+    }
+    return nullptr;
+  }
+};
+using EnvP = shared_ptr<Env>;
+enum class Sig { None, Break, Continue, Return };
+
+struct NativeFn : Callable {
+  function<Value(vector<Value>&, int)> fn;
+  NativeFn(string n, int ar, function<Value(vector<Value>&, int)> f) { name = n; arity = ar; fn = move(f); }
+  Value call(Interp&, vector<Value>& a, int line) override { return fn(a, line); }
+};
+
+struct Interp {
+  EnvP globals = make_shared<Env>();
+  Value retVal; int depth = 0;
+  vector<vector<SP>> keepAlive;  // keeps ASTs alive for closures (REPL)
+
+  Interp() {
+    auto def = [&](const string& n, int ar, function<Value(vector<Value>&, int)> f) {
+      Value v; v.ty = Value::Fn; v.f = make_shared<NativeFn>(n, ar, move(f)); globals->vars[n] = v;
+    };
+    auto numArg = [](vector<Value>& a, int line) {
+      if (a[0].ty != Value::Num) throw AcribeError{"Expected a number", line};
+      return a[0].n;
+    };
+    def("print", -1, [](vector<Value>& a, int) {
+      for (size_t i = 0; i < a.size(); i++) { if (i) cout << ' '; cout << toStr(a[i]); }
+      cout << '\n'; return Value();
+    });
+    def("len", 1, [](vector<Value>& a, int line) {
+      if (a[0].ty != Value::Str) throw AcribeError{"len() expects a string", line};
+      return Value::num((double)a[0].s.size());
+    });
+    def("str", 1, [](vector<Value>& a, int) { return Value::str(toStr(a[0])); });
+    def("num", 1, [](vector<Value>& a, int line) {
+      if (a[0].ty == Value::Num) return a[0];
+      try { return Value::num(stod(toStr(a[0]))); } catch (...) { throw AcribeError{"Cannot convert to number", line}; }
+    });
+    def("sqrt", 1, [numArg](vector<Value>& a, int l) { return Value::num(sqrt(numArg(a, l))); });
+    def("floor", 1, [numArg](vector<Value>& a, int l) { return Value::num(floor(numArg(a, l))); });
+    def("clock", 0, [](vector<Value>&, int) { return Value::num((double)clock() / CLOCKS_PER_SEC); });
+    def("input", 0, [](vector<Value>&, int) { string s; getline(cin, s); return Value::str(s); });
+  }
+
+  struct UserFn : Callable {
+    SP decl; EnvP closure;
+    Value call(Interp& in, vector<Value>& args, int) override {
+      auto env = make_shared<Env>(closure);
+      for (size_t i = 0; i < decl->params.size(); i++) env->vars[decl->params[i]] = args[i];
+      in.retVal = Value();
+      if (++in.depth > 3000) { in.depth = 0; throw AcribeError{"Stack overflow (recursion too deep)", decl->line}; }
+      Sig s = Sig::None;
+      for (auto& st : decl->body) { s = in.exec(st.get(), env); if (s == Sig::Return) break; }
+      in.depth--;
+      Value r = (s == Sig::Return) ? in.retVal : Value();
+      in.retVal = Value();
+      return r;
+    }
+  };
+
+  Value eval(Expr* e, const EnvP& env) {
+    switch (e->k) {
+      case Expr::Lit: return e->val;
+      case Expr::Var: {
+        Value* v = env->find(e->name);
+        if (!v) throw AcribeError{"Undefined variable '" + e->name + "'", e->line};
+        return *v;
+      }
+      case Expr::Assign: {
+        Value val = eval(e->a.get(), env);
+        Value* v = env->find(e->name);
+        if (!v) throw AcribeError{"Undefined variable '" + e->name + "'", e->line};
+        *v = val; return val;
+      }
+      case Expr::Unary: {
+        Value v = eval(e->a.get(), env);
+        if (e->op == T::Bang) return Value::boolean(!truthy(v));
+        if (v.ty != Value::Num) throw AcribeError{"Operand of '-' must be a number", e->line};
+        return Value::num(-v.n);
+      }
+      case Expr::Logic: {
+        Value l = eval(e->a.get(), env);
+        if (e->op == T::Or) { if (truthy(l)) return l; }
+        else if (!truthy(l)) return l;
+        return eval(e->b.get(), env);
+      }
+      case Expr::Binary: return binary(e, env);
+      case Expr::Call: {
+        Value c = eval(e->a.get(), env);
+        if (c.ty != Value::Fn) throw AcribeError{"Can only call functions", e->line};
+        vector<Value> args; args.reserve(e->args.size());
+        for (auto& a : e->args) args.push_back(eval(a.get(), env));
+        if (c.f->arity >= 0 && (int)args.size() != c.f->arity)
+          throw AcribeError{c.f->name + "() expects " + to_string(c.f->arity) + " argument(s), got " + to_string(args.size()), e->line};
+        return c.f->call(*this, args, e->line);
+      }
+    }
+    return Value();
+  }
+
+  Value binary(Expr* e, const EnvP& env) {
+    Value l = eval(e->a.get(), env), r = eval(e->b.get(), env);
+    int ln = e->line;
+    switch (e->op) {
+      case T::EqEq: return Value::boolean(equals(l, r));
+      case T::Ne: return Value::boolean(!equals(l, r));
+      case T::Plus:
+        if (l.ty == Value::Num && r.ty == Value::Num) return Value::num(l.n + r.n);
+        if (l.ty == Value::Str || r.ty == Value::Str) return Value::str(toStr(l) + toStr(r));
+        throw AcribeError{"Operands of '+' must be numbers or strings", ln};
+      default: break;
+    }
+    if (l.ty == Value::Str && r.ty == Value::Str) {
+      switch (e->op) {
+        case T::Lt: return Value::boolean(l.s < r.s);  case T::Le: return Value::boolean(l.s <= r.s);
+        case T::Gt: return Value::boolean(l.s > r.s);  case T::Ge: return Value::boolean(l.s >= r.s);
+        default: break;
+      }
+    }
+    if (l.ty != Value::Num || r.ty != Value::Num) throw AcribeError{"Operands must be numbers", ln};
+    switch (e->op) {
+      case T::Minus: return Value::num(l.n - r.n);
+      case T::Star: return Value::num(l.n * r.n);
+      case T::Slash: if (r.n == 0) throw AcribeError{"Division by zero", ln}; return Value::num(l.n / r.n);
+      case T::Percent: if (r.n == 0) throw AcribeError{"Modulo by zero", ln}; return Value::num(fmod(l.n, r.n));
+      case T::Lt: return Value::boolean(l.n < r.n);  case T::Le: return Value::boolean(l.n <= r.n);
+      case T::Gt: return Value::boolean(l.n > r.n);  case T::Ge: return Value::boolean(l.n >= r.n);
+      default: break;
+    }
+    return Value();
+  }
+
+  Sig execBlock(vector<SP>& body, const EnvP& env) {
+    for (auto& s : body) { Sig g = exec(s.get(), env); if (g != Sig::None) return g; }
+    return Sig::None;
+  }
+
+  Sig exec(Stmt* s, const EnvP& env) {
+    switch (s->k) {
+      case Stmt::ExprS: eval(s->e.get(), env); return Sig::None;
+      case Stmt::Let: env->vars[s->name] = s->e ? eval(s->e.get(), env) : Value(); return Sig::None;
+      case Stmt::Block: return execBlock(s->body, make_shared<Env>(env));
+      case Stmt::If:
+        if (truthy(eval(s->e.get(), env))) return exec(s->a.get(), env);
+        if (s->b) return exec(s->b.get(), env);
+        return Sig::None;
+      case Stmt::While:
+        while (truthy(eval(s->e.get(), env))) {
+          Sig g = exec(s->a.get(), env);
+          if (g == Sig::Break) break;
+          if (g == Sig::Return) return g;
+        }
+        return Sig::None;
+      case Stmt::For: {
+        auto loopEnv = make_shared<Env>(env);
+        if (s->a) exec(s->a.get(), loopEnv);
+        while (!s->e || truthy(eval(s->e.get(), loopEnv))) {
+          Sig g = exec(s->b.get(), loopEnv);
+          if (g == Sig::Break) break;
+          if (g == Sig::Return) return g;
+          if (s->inc) eval(s->inc.get(), loopEnv);
+        }
+        return Sig::None;
+      }
+      case Stmt::Fn: {
+        auto f = make_shared<UserFn>();
+        f->name = s->name; f->arity = (int)s->params.size();
+        f->decl = shared_ptr<Stmt>(s, [](Stmt*) {});  // AST is kept alive by keepAlive
+        f->closure = env;
+        Value v; v.ty = Value::Fn; v.f = f;
+        env->vars[s->name] = v;
+        return Sig::None;
+      }
+      case Stmt::Return: retVal = s->e ? eval(s->e.get(), env) : Value(); return Sig::Return;
+      case Stmt::Break: return Sig::Break;
+      case Stmt::Continue: return Sig::Continue;
+    }
+    return Sig::None;
+  }
+
+  void run(const string& src) {
+    Parser ps(lex(src));
+    keepAlive.push_back(ps.program());
+    for (auto& s : keepAlive.back()) {
+      Sig g = exec(s.get(), globals);
+      if (g == Sig::Return) break;
+    }
+  }
+};
+
+// ============================== Main ============================
+int main(int argc, char** argv) {
+  ios::sync_with_stdio(false);
+  Interp in;
+  if (argc >= 2) {
+    ifstream f(argv[1]);
+    if (!f) { cerr << "Cannot open file: " << argv[1] << "\n"; return 1; }
+    stringstream ss; ss << f.rdbuf();
+    try { in.run(ss.str()); }
+    catch (AcribeError& e) { cout.flush(); cerr << "[line " << e.line << "] Error: " << e.msg << "\n"; return 70; }
+    return 0;
+  }
+  cout << "Acribe v0.1 - type code, Ctrl+D to exit\n";
+  string line;
+  while (cout << ">>> " << flush, getline(cin, line)) {
+    try { in.run(line); }
+    catch (AcribeError& e) { cout.flush(); cerr << "[line " << e.line << "] Error: " << e.msg << "\n"; in.depth = 0; }
+  }
+  return 0;
+}
